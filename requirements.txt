@@ -1,0 +1,9 @@
+PyQt6>=6.5
+numpy>=1.24
+scipy>=1.10
+sounddevice>=0.5
+pyrtlsdr>=0.4
+pyserial>=3.5
+
+# Poznámka: Airspy podpora používá nativní ctypes wrapper (sdr/airspy_native.py)
+# Vyžaduje systémový balíček: libairspy0 (apt install libairspy0)

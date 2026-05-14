@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+*.egg-info/
+dist/
+build/
+recordings/
+*.wav
+~/.sdrtrunk_config.json
+.DS_Store
+*.swp
+*.swo
