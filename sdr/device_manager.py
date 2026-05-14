@@ -75,6 +75,12 @@ class SDRDevice(ABC):
     @abstractmethod
     def set_bb_gain(self, gain: int): ...
     @abstractmethod
+    def set_lna_gain(self, gain: int): ...
+    @abstractmethod
+    def set_mixer_gain(self, gain: int): ...
+    @abstractmethod
+    def set_vga_gain(self, gain: int): ...
+    @abstractmethod
     def set_bias_t(self, enabled: bool): ...
     @abstractmethod
     def set_direct_sampling(self, enabled: bool): ...
@@ -144,7 +150,6 @@ class RTLSDRDevice(SDRDevice):
         while self._running and self._dev:
             try:
                 samples = self._dev.read_samples(256 * 16, timeout=1)
-                print(f"[Debug] Device read {len(samples)} samples.")
                 if self._callback and len(samples) > 0:
                     self._callback(samples.astype(np.complex64))
             except:
@@ -166,6 +171,23 @@ class RTLSDRDevice(SDRDevice):
                 self._dev.freq_correction = ppm
             except:
                 pass
+
+    def set_lna_gain(self, gain: int):
+        if self._dev:
+            try:
+                self._dev.gain = gain
+            except:
+                pass
+
+    def set_mixer_gain(self, gain: int):
+        if self._dev:
+            try:
+                self._dev.set_if_gain(0, gain)
+            except:
+                pass
+
+    def set_vga_gain(self, gain: int):
+        pass
 
     def set_gain(self, gain: int):
         if self._dev:
@@ -263,7 +285,6 @@ class AirspyDevice(SDRDevice):
         while self._running and self._dev:
             try:
                 samples = self._dev.read_samples(1024 * 16)
-                print(f"[Debug] Device read {len(samples)} samples.")
                 if self._callback:
                     self._callback(samples.astype(np.complex64))
             except:
@@ -286,6 +307,27 @@ class AirspyDevice(SDRDevice):
 
     def set_freq_correction(self, ppm: int):
         pass
+
+    def set_lna_gain(self, gain: int):
+        if self._dev:
+            try:
+                self._dev.lna_gain = gain
+            except:
+                pass
+
+    def set_mixer_gain(self, gain: int):
+        if self._dev:
+            try:
+                self._dev.mixer_gain = gain
+            except:
+                pass
+
+    def set_vga_gain(self, gain: int):
+        if self._dev:
+            try:
+                self._dev.vga_gain = gain
+            except:
+                pass
 
     def set_gain(self, gain: int):
         if self._dev:

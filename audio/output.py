@@ -1,6 +1,6 @@
 import numpy as np
 import threading
-from typing import Optional, Callable
+from typing import Optional
 from collections import deque
 from scipy import signal as scipy_signal
 
@@ -32,41 +32,17 @@ class AudioFilter:
         return audio
 
 
-class AudioAGC:
-    def __init__(self, rate: float = 48000.0):
-        self._rate = rate
-        self._gain = 0.5
-        self._attack = 0.01
-        self._decay = 0.005
-        self._target = 0.25
-        self._max_gain = 20.0
-        self._min_gain = 0.01
-
-    def process(self, audio: np.ndarray) -> np.ndarray:
-        if len(audio) < 4:
-            return audio
-        peak = np.max(np.abs(audio))
-        if peak > 0:
-            diff = self._target / (peak + 1e-10)
-            if diff > self._gain:
-                self._gain += self._attack * (diff - self._gain)
-            else:
-                self._gain += self._decay * (diff - self._gain)
-            self._gain = np.clip(self._gain, self._min_gain, self._max_gain)
-        return np.clip(audio * self._gain, -1.0, 1.0)
-
-
 class AudioEngine:
     def __init__(self, sample_rate: float = 48000.0):
         self._sr = sample_rate
         self._stream: Optional = None
         self._volume: float = 0.8
         self._muted: bool = False
-        self._buffer: deque = deque(maxlen=30)
+        self._buffer: deque = deque(maxlen=60)
         self._lock = threading.Lock()
         self._running = False
         self._filter = AudioFilter(sample_rate)
-        self._agc = AudioAGC(sample_rate)
+        self._last_audio_level: float = 0.0
 
     def open(self) -> bool:
         try:
@@ -94,6 +70,8 @@ class AudioEngine:
             except:
                 pass
             self._stream = None
+        with self._lock:
+            self._buffer.clear()
 
     def _callback(self, outdata, frames, time_info, status):
         with self._lock:
@@ -108,6 +86,8 @@ class AudioEngine:
                     outdata[len(data):] = 0
                 else:
                     outdata[:] = data[:needed].reshape(-1, 1) * self._volume
+                    if len(data) > needed:
+                        self._buffer.appendleft(data[needed:])
             except IndexError:
                 outdata[:] = 0
 
@@ -115,8 +95,15 @@ class AudioEngine:
         with self._lock:
             if self._running:
                 processed = self._filter.apply(samples)
-                processed = self._agc.process(processed)
+                processed = np.clip(processed, -1.0, 1.0)
                 self._buffer.append(processed)
+
+    @property
+    def audio_level(self) -> float:
+        with self._lock:
+            if self._buffer:
+                return float(np.max(np.abs(self._buffer[-1]))) if len(self._buffer[-1]) > 0 else 0.0
+            return 0.0
 
     def set_notch(self, freq_hz: float):
         self._filter.set_notch(freq_hz)
@@ -126,9 +113,6 @@ class AudioEngine:
 
     def set_muted(self, muted: bool):
         self._muted = muted
-
-    def set_agc(self, enabled: bool):
-        pass
 
     @property
     def is_open(self) -> bool:
@@ -143,14 +127,18 @@ class AudioRecorder:
         self._lock = threading.Lock()
         self._rec_start_time = 0.0
         self._max_duration = 3600
+        self._freq_hz: float = 0.0
+        self._mode: str = ""
         import os as _os
         _os.makedirs(self._dir, exist_ok=True)
 
-    def start_recording(self):
+    def start_recording(self, freq_hz: float = 0.0, mode: str = ""):
         with self._lock:
             self._buffer.clear()
             self._recording = True
             self._rec_start_time = __import__('time').time()
+            self._freq_hz = freq_hz
+            self._mode = mode
 
     def stop_recording(self) -> Optional[str]:
         import os, time, wave
@@ -161,7 +149,10 @@ class AudioRecorder:
             self._recording = False
             data = np.concatenate(self._buffer)
             self._buffer.clear()
-        fname = os.path.join(self._dir, f"rec_{int(time.time())}.wav")
+        freq_str = f"{self._freq_hz / 1e6:.3f}MHz" if self._freq_hz else "unknown"
+        mod_str = f"_{self._mode}" if self._mode else ""
+        ts = int(time.time())
+        fname = os.path.join(self._dir, f"rec_{ts}_{freq_str}{mod_str}.wav")
         data = np.clip(data * 32767, -32768, 32767).astype(np.int16)
         try:
             with wave.open(fname, "wb") as wf:

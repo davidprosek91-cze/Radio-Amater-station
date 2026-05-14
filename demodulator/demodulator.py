@@ -12,16 +12,14 @@ class Demodulator(ABC):
         self._squelch_open: bool = False
         self._sample_rate: float = 2.4e6
         self._audio_rate: float = 48000.0
-        self._agc_enabled: bool = True
-        self._agc_attack: float = 0.01
-        self._agc_decay: float = 0.001
-        self._agc_gain: float = 1.0
         self._noise_blanker: bool = False
         self._nb_threshold: float = 3.0
         self._ctcss_freq: float = 0.0
         self._ctcss_detected: float = 0.0
         self._lp_filter: Optional[np.ndarray] = None
         self._hp_filter: Optional[np.ndarray] = None
+        self._hp_sos: Optional[np.ndarray] = None
+        self._hp_zi: Optional[np.ndarray] = None
 
     def set_callback(self, cb: Callable[[np.ndarray], None]):
         self._callback = cb
@@ -40,9 +38,6 @@ class Demodulator(ABC):
         self._audio_rate = ar
         self._build_filters()
 
-    def set_agc(self, enabled: bool):
-        self._agc_enabled = enabled
-
     def set_noise_blanker(self, enabled: bool, threshold: float = 3.0):
         self._noise_blanker = enabled
         self._nb_threshold = threshold
@@ -59,6 +54,8 @@ class Demodulator(ABC):
         hp_cut = max(100, self._audio_rate * 0.005)
         if hp_cut < self._sample_rate * 0.5:
             self._hp_filter = scipy_signal.firwin(63, hp_cut, fs=self._sample_rate, pass_zero=False)
+        self._hp_sos = scipy_signal.butter(4, 300, btype='high', fs=self._sample_rate, output='sos')
+        self._hp_zi = scipy_signal.sosfilt_zi(self._hp_sos) * 0
 
     def _apply_filters(self, audio: np.ndarray) -> np.ndarray:
         if self._lp_filter is not None and len(audio) > len(self._lp_filter):
@@ -66,21 +63,6 @@ class Demodulator(ABC):
         if self._hp_filter is not None and len(audio) > len(self._hp_filter):
             audio = scipy_signal.convolve(audio, self._hp_filter, mode='same')
         return audio
-
-    def _apply_agc(self, audio: np.ndarray) -> np.ndarray:
-        if not self._agc_enabled:
-            return audio
-        peak = np.max(np.abs(audio))
-        if peak > 0:
-            target = 0.3
-            error = target - peak
-            if error > 0:
-                self._agc_gain += self._agc_attack * error
-            else:
-                self._agc_gain += self._agc_decay * error
-            self._agc_gain = max(0.1, min(10.0, self._agc_gain))
-            audio = audio * self._agc_gain
-        return np.clip(audio, -1.0, 1.0)
 
     def _apply_noise_blanker(self, audio: np.ndarray) -> np.ndarray:
         if not self._noise_blanker:
@@ -105,9 +87,15 @@ class Demodulator(ABC):
     def _squelch_check(self, audio: np.ndarray) -> bool:
         if len(audio) < 4:
             return False
+        if self._squelch_threshold <= 0:
+            return True
         if self._squelch_type == "noise":
-            noise = audio - scipy_signal.medfilt(audio, 5)
-            noise_pwr = np.sqrt(np.mean(noise ** 2))
+            # Fast noise estimation via HP filter
+            if self._hp_sos is not None:
+                filtered, _ = scipy_signal.sosfilt(self._hp_sos, audio, zi=self._hp_zi * 0)
+            else:
+                filtered = audio - np.mean(audio)
+            noise_pwr = np.sqrt(np.mean(filtered ** 2))
             audio_pwr = np.sqrt(np.mean(audio ** 2))
             ratio = audio_pwr / (noise_pwr + 1e-10)
             return ratio > self._squelch_threshold
@@ -123,7 +111,7 @@ class Demodulator(ABC):
         ratio = self._sample_rate / self._audio_rate
         if ratio < 1:
             return audio
-        decim = max(1, int(ratio))
+        decim = max(1, int(np.round(ratio)))
         if decim > 1 and len(audio) >= decim + 10:
             audio = scipy_signal.decimate(audio, decim, ftype='iir', zero_phase=True)
         return audio
@@ -139,7 +127,6 @@ class Demodulator(ABC):
         audio = self._apply_noise_blanker(audio)
         audio = self._apply_filters(audio)
         audio = self._decimate(audio)
-        audio = self._apply_agc(audio)
         self._ctcss_detected = self._detect_ctcss(audio)
         self._squelch_open = self._squelch_check(audio)
         if not self._squelch_open:

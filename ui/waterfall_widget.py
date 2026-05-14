@@ -1,48 +1,110 @@
 import numpy as np
+from typing import Optional
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
 from PyQt6.QtGui import QPainter, QColor, QLinearGradient, QPen, QFont
 from PyQt6.QtCore import Qt, QRectF
+
+
+S_UNITS = [
+    ("S9+60", -13), ("S9+50", -23), ("S9+40", -33),
+    ("S9+30", -43), ("S9+20", -53), ("S9+10", -63),
+    ("S9",    -73), ("S8",    -79), ("S7",    -85),
+    ("S6",    -91), ("S5",    -97), ("S4",   -103),
+    ("S3",   -109), ("S2",   -115), ("S1",   -121),
+]
 
 
 class SMeterWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._dbm: float = -120.0
-        self.setFixedSize(200, 30)
+        self._peak: float = -120.0
+        self._decay = 0.97
+        self.setFixedSize(260, 42)
 
     def set_dbm(self, dbm: float):
         self._dbm = dbm
+        self._peak = max(self._peak * self._decay, dbm)
         self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
+        margin = 4
+        bar_w = w - 2 * margin
+        bar_h = 16
+        bar_y = 2
+
         painter.fillRect(0, 0, w, h, QColor(10, 10, 20))
         painter.setPen(QPen(QColor(60, 60, 80), 1))
-        painter.drawRect(0, 0, w - 1, h - 1)
-        norm = (self._dbm + 130) / 140.0
+        painter.drawRect(margin, bar_y, bar_w, bar_h)
+
+        db_min, db_max = -130, -10
+        norm = (self._dbm - db_min) / (db_max - db_min)
         norm = max(0, min(1, norm))
-        fill_w = int((w - 4) * norm)
+        fill_w = int(bar_w * norm)
         if fill_w > 0:
-            grad = QLinearGradient(0, 0, fill_w, 0)
-            grad.setColorAt(0, QColor(0, 180, 0, 120))
-            grad.setColorAt(0.5, QColor(180, 180, 0, 120))
-            grad.setColorAt(0.8, QColor(200, 80, 0, 120))
-            grad.setColorAt(1, QColor(200, 0, 0, 120))
-            painter.fillRect(2, 2, fill_w, h - 4, grad)
-        painter.setPen(QColor(0, 255, 100))
-        font = QFont("Courier", 9)
+            grad = QLinearGradient(margin, 0, margin + bar_w, 0)
+            grad.setColorAt(0.0, QColor(0, 160, 0))
+            grad.setColorAt(0.3, QColor(0, 200, 0))
+            grad.setColorAt(0.5, QColor(180, 200, 0))
+            grad.setColorAt(0.65, QColor(200, 160, 0))
+            grad.setColorAt(0.8, QColor(200, 80, 0))
+            grad.setColorAt(1.0, QColor(200, 0, 0))
+            painter.fillRect(margin + 1, bar_y + 1, fill_w - 1, bar_h - 2, grad)
+
+        # S-unit tick marks
+        painter.setPen(QPen(QColor(100, 100, 120), 1))
+        font = QFont("Sans", 6)
         painter.setFont(font)
-        s_units = self._dbm_to_s(self._dbm)
-        painter.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, f"{self._dbm:.0f} dBm  {s_units}")
+        for label, val in S_UNITS:
+            if val < db_min or val > db_max:
+                continue
+            x = margin + int(bar_w * (val - db_min) / (db_max - db_min))
+            painter.setPen(QPen(QColor(120, 120, 140, 100), 1))
+            painter.drawLine(x, bar_y, x, bar_y + bar_h)
+            painter.setPen(QColor(160, 160, 180))
+            painter.drawText(x - 12, bar_y + bar_h + 1, 24, 10, Qt.AlignmentFlag.AlignCenter, label)
+
+        # Peak dot
+        peak_norm = (self._peak - db_min) / (db_max - db_min)
+        peak_x = margin + int(bar_w * peak_norm)
+        painter.setPen(QPen(QColor(255, 255, 255), 2))
+        painter.drawEllipse(peak_x - 2, bar_y - 1, 5, 5)
+
+        # dBm value overlay
+        painter.setPen(QColor(0, 255, 100))
+        font2 = QFont("Courier", 9, QFont.Weight.Bold)
+        painter.setFont(font2)
+        s_text = self._dbm_to_s(self._dbm)
+        painter.drawText(QRectF(margin, bar_y, bar_w, bar_h), Qt.AlignmentFlag.AlignCenter,
+                         f"{self._dbm:.0f} dBm  {s_text}")
+
+        # Audio level meter (bottom bar)
+        audio_y = bar_y + bar_h + 14
+        painter.setPen(QPen(QColor(60, 60, 80), 1))
+        painter.drawRect(margin, audio_y, bar_w, 8)
+        audio_level = getattr(self.parent(), '_audio_level', 0) if self.parent() else 0
+        audio_norm = max(0, min(1, audio_level * 3))
+        if audio_norm > 0:
+            agrad = QLinearGradient(margin, 0, margin + bar_w, 0)
+            agrad.setColorAt(0, QColor(0, 180, 0))
+            agrad.setColorAt(0.6, QColor(0, 200, 100))
+            agrad.setColorAt(0.85, QColor(200, 200, 0))
+            agrad.setColorAt(1, QColor(200, 0, 0))
+            aw = int(bar_w * audio_norm)
+            painter.fillRect(margin + 1, audio_y + 1, aw - 1, 6, agrad)
+
+        painter.setPen(QColor(100, 160, 200))
+        font3 = QFont("Sans", 6)
+        painter.setFont(font3)
+        painter.drawText(margin, audio_y + 7, "AUDIO")
+
         painter.end()
 
     def _dbm_to_s(self, dbm: float) -> str:
-        levels = [('S9+40', -33), ('S9+20', -53), ('S9+10', -63),
-                  ('S9', -73), ('S8', -79), ('S7', -85), ('S6', -91),
-                  ('S5', -97), ('S4', -103), ('S3', -109), ('S2', -115), ('S1', -121)]
-        for label, val in levels:
+        for label, val in S_UNITS:
             if dbm >= val:
                 return label
         return "S0"
@@ -210,10 +272,6 @@ class SpectrumWidget(QWidget):
             y = int(h * (1 - norm))
             fill_path.append((x, y))
 
-        gradient = QLinearGradient(0, h, 0, 0)
-        gradient.setColorAt(0, QColor(0, 100, 200, 30))
-        gradient.setColorAt(1, QColor(0, 200, 255, 120))
-        painter.setPen(Qt.PenStyle.NoPen)
         for i in range(1, len(fill_path)):
             x1, y1 = fill_path[i - 1]
             x2, y2 = fill_path[i]

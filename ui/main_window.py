@@ -1,13 +1,13 @@
 import sys, threading, time, numpy as np
+from typing import Optional
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
     QPushButton, QLabel, QComboBox, QSpinBox, QDoubleSpinBox,
-    QGroupBox, QFormLayout, QSlider, QCheckBox, QStatusBar,
-    QSplitter, QFrame, QMessageBox, QFileDialog, QApplication,
-    QToolBar, QDial, QTextEdit, QInputDialog, QMenu, QMenuBar
+    QSlider, QCheckBox, QStatusBar, QSplitter, QTextEdit, QMenuBar,
+    QGridLayout, QFrame, QMessageBox, QApplication,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt6.QtGui import QAction, QFont, QIcon
+from PyQt6.QtGui import QFont, QAction
 
 from config.settings import Settings, BAND_PLANS, CZ_REPEATERS, SIMPAX
 from sdr.device_manager import DeviceManager
@@ -22,6 +22,16 @@ from ui.channel_table import ChannelTableWidget
 from ui.scanner_panel import ScannerPanel
 from ui.trunk_panel import TrunkPanel
 from ui.frequency_editor import FrequencyEditor
+
+
+BAND_ORDER = ["160m","80m","40m","30m","20m","17m","15m","12m","10m","6m","2m","70cm","23cm"]
+MODES = ["NFM","FM","AM","USB","LSB","WFM"]
+
+FREQ_STEPS = [
+    ("1 kHz", 1e3), ("5 kHz", 5e3), ("8.33 kHz", 8.33e3),
+    ("10 kHz", 10e3), ("12.5 kHz", 12.5e3), ("25 kHz", 25e3),
+    ("50 kHz", 50e3), ("100 kHz", 100e3),
+]
 
 
 class SignalBridge(QObject):
@@ -47,9 +57,12 @@ class MainWindow(QMainWindow):
         self.bridge = SignalBridge()
         self._init_components()
         self._running = False
-        self._current_freq: float = self.settings.last_freq or 145.500e6
+        self._vfo_a: float = self.settings.last_freq or 145.500e6
+        self._vfo_b: float = 145.500e6
+        self._vfo_active: str = "A"
+        self._current_freq: float = self._vfo_a
         self._current_mod: str = self.settings.last_modulation or "NFM"
-        self._current_channel: Channel = None
+        self._current_channel: Optional[Channel] = None
         self._init_ui()
         self._connect_signals()
         self._sdr_thread_running = False
@@ -57,6 +70,7 @@ class MainWindow(QMainWindow):
         self._dtmf_decoder = DTMFDecoder()
         self._demod = None
         self._squelched_count = 0
+        self._last_band = ""
         self._restore_state()
 
     def _init_components(self):
@@ -70,19 +84,19 @@ class MainWindow(QMainWindow):
         self._decoder = None
 
     def _init_ui(self):
-        self.setWindowTitle("SDRTrunk - Profesionální SDR rádio pro radioamatéry")
-        self.setMinimumSize(1280, 860)
-
+        self.setWindowTitle("RadioAmater Station")
+        self.setMinimumSize(1320, 900)
         self._setup_menus()
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setSpacing(2)
-        main_layout.setContentsMargins(4, 2, 4, 2)
+        ml = QVBoxLayout(central)
+        ml.setSpacing(2)
+        ml.setContentsMargins(4, 2, 4, 2)
 
-        self._build_receiver_bar(main_layout)
-        self._build_vfo_controls(main_layout)
-        self._build_audio_bar(main_layout)
+        self._build_top_bar(ml)
+        self._build_vfo_section(ml)
+        self._build_band_mod_bar(ml)
+        self._build_controls_bar(ml)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         top_split = QSplitter(Qt.Orientation.Horizontal)
@@ -90,17 +104,19 @@ class MainWindow(QMainWindow):
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(1)
 
         self.spectrum = SpectrumWidget()
-        self.spectrum.setMinimumHeight(130)
+        self.spectrum.setMinimumHeight(120)
         self.waterfall = WaterfallWidget()
         self.waterfall.setMinimumHeight(150)
 
-        band_bands = []
-        for key, bp in BAND_PLANS.items():
-            if bp['lo'] < self._current_freq < bp['hi']:
-                band_bands.append((key, bp['lo'], bp['hi'], (60, 60, 100)))
-        self._update_band_display()
+        # S-meter inline next to spectrum
+        smeter_row = QHBoxLayout()
+        smeter_row.setSpacing(2)
+        self._s_meter = SMeterWidget()
+        smeter_row.addWidget(self._s_meter, 1)
+        left_layout.addLayout(smeter_row)
 
         left_layout.addWidget(self.spectrum, 2)
         left_layout.addWidget(self.waterfall, 3)
@@ -110,71 +126,72 @@ class MainWindow(QMainWindow):
         self.channel_table = ChannelTableWidget()
         self.scanner_panel = ScannerPanel()
         self.trunk_panel = TrunkPanel()
-        self._tabs.addTab(self.channel_table, "📡 Kanály")
-        self._tabs.addTab(self.scanner_panel, "🔍 Skener")
-        self._tabs.addTab(self.trunk_panel, "📞 Trunking")
-
+        self._tabs.addTab(self.channel_table, "Kan\u00e1ly")
+        self._tabs.addTab(self.scanner_panel, "Skener")
+        self._tabs.addTab(self.trunk_panel, "Trunking")
         self._build_info_tab()
         top_split.addWidget(self._tabs)
         top_split.setSizes([650, 550])
 
         self._log = QTextEdit()
         self._log.setReadOnly(True)
-        self._log.setMaximumHeight(100)
+        self._log.setMaximumHeight(80)
         self._log.setFont(QFont("Courier", 9))
-        self._log.setStyleSheet("QTextEdit { background-color: #0a0a12; color: #00cc88; }")
+        self._log.setStyleSheet(
+            "QTextEdit { background-color: #0a0a12; color: #00cc88; border: 1px solid #1a3a2a; }"
+        )
 
         splitter.addWidget(top_split)
         splitter.addWidget(self._log)
-        splitter.setSizes([550, 80])
-        main_layout.addWidget(splitter, 1)
+        splitter.setSizes([550, 60])
+        ml.addWidget(splitter, 1)
 
         self._build_status_bar()
 
     def _setup_menus(self):
         mb = self.menuBar()
-        file_menu = mb.addMenu("Soubor")
-        file_menu.addAction("Import CSV", lambda: self.channel_table._import_csv())
-        file_menu.addAction("Export CSV", lambda: self.channel_table._export_csv())
-        file_menu.addSeparator()
-        file_menu.addAction("Konec", self.close)
-        rx_menu = mb.addMenu("Přijímač")
-        rx_menu.addAction("Ztlumit", lambda: self.audio_engine.set_muted(True))
-        rx_menu.addAction("Odmlčet", lambda: self.audio_engine.set_muted(False))
-        rx_menu.addSeparator()
-        rx_menu.addAction("Nahrávat", lambda: self._toggle_record(True))
-        rx_menu.addAction("Zastavit nahrávání", lambda: self._toggle_record(False))
-        bands_menu = mb.addMenu("Pásma")
-        for key in BAND_PLANS:
-            bands_menu.addAction(f"{key} ({BAND_PLANS[key]['name']})",
-                                 lambda k=key: self._jump_to_band(k))
-        tools_menu = mb.addMenu("Nástroje")
-        tools_menu.addAction("DMR dekodér", lambda: self._set_decoder("DMR"))
-        tools_menu.addAction("P25 dekodér", lambda: self._set_decoder("P25"))
-        tools_menu.addAction("APRS dekodér", lambda: self._set_decoder("APRS"))
-        tools_menu.addAction("Vypnout dekodér", lambda: self._set_decoder(""))
-        repeaters_menu = mb.addMenu("Retranslátory")
+        fm = mb.addMenu("Soubor")
+        fm.addAction("Import CSV", lambda: self.channel_table._import_csv())
+        fm.addAction("Export CSV", lambda: self.channel_table._export_csv())
+        fm.addSeparator()
+        fm.addAction("Konec", self.close)
+        rm = mb.addMenu("Prijimac")
+        rm.addAction("Ztlumit", lambda: self.audio_engine.set_muted(True))
+        rm.addAction("Odmlcet", lambda: self.audio_engine.set_muted(False))
+        rm.addSeparator()
+        rm.addAction("Nahravat", lambda: self._toggle_record(True))
+        rm.addAction("Zastavit nahravani", lambda: self._toggle_record(False))
+        bm = mb.addMenu("Pasma")
+        for key in BAND_ORDER:
+            if key in BAND_PLANS:
+                b = BAND_PLANS[key]
+                bm.addAction(f"{key} ({b['name']})", lambda k=key: self._jump_to_band(k))
+        tm = mb.addMenu("Nastroje")
+        tm.addAction("DMR dekoder", lambda: self._set_decoder("DMR"))
+        tm.addAction("P25 dekoder", lambda: self._set_decoder("P25"))
+        tm.addAction("APRS dekoder", lambda: self._set_decoder("APRS"))
+        tm.addAction("Vypnout dekoder", lambda: self._set_decoder(""))
+        rpt = mb.addMenu("Retranslatory")
         for r in CZ_REPEATERS:
-            repeaters_menu.addAction(f"{r['name']} ({r['freq']/1e6:.3f} MHz - {r['city']})",
-                                     lambda r=r: self._jump_to_repeater(r))
-        simpx_menu = mb.addMenu("Simplex")
+            rpt.addAction(f"{r['name']} ({r['freq']/1e6:.3f} - {r['city']})",
+                          lambda r=r: self._jump_to_repeater(r))
+        spx = mb.addMenu("Simplex")
         for s in SIMPAX:
-            simpx_menu.addAction(f"{s['name']} ({s['freq']/1e6:.3f} MHz)",
-                                  lambda s=s: self._set_frequency(s['freq']))
+            spx.addAction(f"{s['name']} ({s['freq']/1e6:.3f})",
+                          lambda s=s: self._set_frequency(s['freq']))
 
-    def _build_receiver_bar(self, parent):
+    def _build_top_bar(self, parent):
         bar = QHBoxLayout()
         bar.setSpacing(6)
         self._lbl_device = QLabel("SDR:")
         self._cmb_device = QComboBox()
-        self._cmb_device.setMinimumWidth(160)
-        self._btn_refresh = QPushButton("🔍")
-        self._btn_refresh.setToolTip("Vyhledat SDR zařízení")
+        self._cmb_device.setMinimumWidth(150)
+        self._btn_refresh = QPushButton("Obnovit")
         self._btn_refresh.clicked.connect(self._enumerate_devices)
-        self._btn_start = QPushButton("▶ START")
+        self._btn_start = QPushButton("RX")
         self._btn_start.setStyleSheet(
             "QPushButton { background: #1a5a1a; color: #00ff88; font-weight: bold; "
-            "padding: 4px 16px; border: 1px solid #2a8a2a; border-radius: 4px; }"
+            "padding: 4px 20px; border: 1px solid #2a8a2a; border-radius: 4px; font-size: 13px; }"
             "QPushButton:hover { background: #2a7a2a; }"
         )
         self._btn_start.clicked.connect(self._toggle_stream)
@@ -182,109 +199,226 @@ class MainWindow(QMainWindow):
         bar.addWidget(self._cmb_device)
         bar.addWidget(self._btn_refresh)
         bar.addWidget(self._btn_start)
-        bar.addWidget(QLabel("  S-meter:"))
-        self._s_meter = SMeterWidget()
-        bar.addWidget(self._s_meter)
+
         bar.addStretch()
-        self._lbl_mode = QLabel("NFM")
-        self._lbl_mode.setStyleSheet("font-size: 14px; font-weight: bold; color: #00ff88; padding: 0 8px;")
-        self._lbl_band_name = QLabel("2m")
-        self._lbl_band_name.setStyleSheet("font-size: 12px; color: #888; padding: 0 4px;")
-        bar.addWidget(self._lbl_band_name)
-        bar.addWidget(self._lbl_mode)
+        rx_led = QLabel()
+        rx_led.setFixedSize(12, 12)
+        rx_led.setStyleSheet(
+            "background: #00ff88; border-radius: 6px;"
+        )
+        bar.addWidget(rx_led)
+        bar.addWidget(QLabel("RX"))
+        self._lbl_rx_freq = QLabel("---")
+        self._lbl_rx_freq.setStyleSheet("color: #00ff88; font-weight: bold; font-size: 12px;")
+        bar.addWidget(self._lbl_rx_freq)
+        bar.addWidget(QLabel("  MODE:"))
+        self._lbl_rx_mode = QLabel("NFM")
+        self._lbl_rx_mode.setStyleSheet(
+            "color: #88ccff; font-weight: bold; font-size: 12px; "
+            "background: #0a0a20; padding: 1px 8px; border: 1px solid #2a4a6a; border-radius: 3px;"
+        )
+        bar.addWidget(self._lbl_rx_mode)
         parent.addLayout(bar)
 
-    def _build_vfo_controls(self, parent):
-        vfo = QHBoxLayout()
+    def _build_vfo_section(self, parent):
+        vfo_frame = QFrame()
+        vfo_frame.setStyleSheet(
+            "QFrame { background: #0a0a14; border: 1px solid #1a2a3a; border-radius: 4px; }"
+        )
+        vfo = QHBoxLayout(vfo_frame)
+        vfo.setSpacing(3)
+        vfo.setContentsMargins(6, 3, 6, 3)
+
+        # VFO A/B buttons
+        self._btn_vfo_a = QPushButton("VFO A")
+        self._btn_vfo_a.setCheckable(True)
+        self._btn_vfo_a.setChecked(True)
+        self._btn_vfo_a.setStyleSheet(self._vfo_btn_style(True))
+        self._btn_vfo_a.clicked.connect(lambda: self._select_vfo("A"))
+        self._btn_vfo_b = QPushButton("VFO B")
+        self._btn_vfo_b.setCheckable(True)
+        self._btn_vfo_b.setStyleSheet(self._vfo_btn_style(False))
+        self._btn_vfo_b.clicked.connect(lambda: self._select_vfo("B"))
+        self._btn_swap = QPushButton("\u21c4")
+        self._btn_swap.setToolTip("Prohodit VFO A a B")
+        self._btn_swap.setFixedWidth(32)
+        self._btn_swap.clicked.connect(self._swap_vfo)
+        vfo.addWidget(self._btn_vfo_a)
+        vfo.addWidget(self._btn_vfo_b)
+        vfo.addWidget(self._btn_swap)
+
+        # Big frequency display
         self._lbl_freq = QLabel(f"{self._current_freq / 1e6:.5f}")
         self._lbl_freq.setStyleSheet(
-            "font-size: 32px; font-weight: bold; color: #00ff88; "
-            "font-family: 'Courier New', monospace; padding: 2px 10px; "
-            "background: #0a0a14; border: 1px solid #2a3a2a; border-radius: 4px;"
+            "font-size: 40px; font-weight: bold; color: #00ff88; "
+            "font-family: 'Courier New', monospace; padding: 2px 14px; "
+            "background: #050510; border: 2px solid #1a3a2a; border-radius: 6px;"
+            "min-width: 280px;"
         )
-        self._lbl_freq.setMinimumWidth(240)
         vfo.addWidget(self._lbl_freq)
-        band_combo = QComboBox()
-        band_combo.setMinimumWidth(120)
-        for key in BAND_PLANS:
-            band_combo.addItem(f"{key} - {BAND_PLANS[key]['name']}")
-        band_combo.currentTextChanged.connect(lambda t: self._jump_to_band(t.split(" ")[0]))
-        vfo.addWidget(QLabel("Pásmo:"))
-        vfo.addWidget(band_combo)
-        vfo.addWidget(QLabel("Mod:"))
-        self._cmb_mod = QComboBox()
-        self._cmb_mod.addItems(["NFM", "FM", "AM", "WFM", "USB", "LSB"])
-        self._cmb_mod.setCurrentText(self._current_mod)
-        self._cmb_mod.currentTextChanged.connect(self._on_modulation_change)
-        vfo.addWidget(self._cmb_mod)
-        vfo.addWidget(QLabel("Krok:"))
+        vfo.addWidget(QLabel("MHz"))
+
+        # Step selector
+        vfo.addWidget(QLabel("  Krok:"))
         self._cmb_step = QComboBox()
-        self._cmb_step.addItems(["5 kHz", "8.33 kHz", "10 kHz", "12.5 kHz", "25 kHz", "50 kHz", "100 kHz"])
+        for label, _ in FREQ_STEPS:
+            self._cmb_step.addItem(label)
         self._cmb_step.setCurrentText("12.5 kHz")
         vfo.addWidget(self._cmb_step)
-        self._btn_up = QPushButton("+")
-        self._btn_up.setFixedWidth(36)
-        self._btn_up.clicked.connect(lambda: self._step_freq(1))
-        self._btn_down = QPushButton("-")
-        self._btn_down.setFixedWidth(36)
-        self._btn_down.clicked.connect(lambda: self._step_freq(-1))
-        vfo.addWidget(self._btn_down)
-        vfo.addWidget(self._btn_up)
-        vfo.addStretch()
-        self._lbl_ctcss = QLabel("")
-        self._lbl_ctcss.setStyleSheet("color: #8888ff; font-size: 11px;")
-        self._lbl_dtmf = QLabel("")
-        self._lbl_dtmf.setStyleSheet("color: #ffaa00; font-size: 11px;")
-        self._lbl_decoder = QLabel("Dekodér: ---")
-        self._lbl_decoder.setStyleSheet("color: #88ff88; font-size: 11px;")
-        self._lbl_talkgroup = QLabel("")
-        self._lbl_talkgroup.setStyleSheet("color: #ff8888; font-size: 11px;")
-        vfo.addWidget(self._lbl_ctcss)
-        vfo.addWidget(self._lbl_dtmf)
-        vfo.addWidget(self._lbl_decoder)
-        vfo.addWidget(self._lbl_talkgroup)
-        parent.addLayout(vfo)
 
-    def _build_audio_bar(self, parent):
-        audio = QHBoxLayout()
-        audio.addWidget(QLabel("Hlasitost:"))
-        self._sld_vol = QSlider(Qt.Orientation.Horizontal)
-        self._sld_vol.setRange(0, 100)
-        self._sld_vol.setValue(int(self.settings.audio.volume * 100))
-        self._sld_vol.setFixedWidth(120)
-        self._sld_vol.valueChanged.connect(lambda v: self.audio_engine.set_volume(v / 100))
-        audio.addWidget(self._sld_vol)
-        self._lbl_vol = QLabel(f"{int(self.settings.audio.volume * 100)}%")
-        audio.addWidget(self._lbl_vol)
-        self._btn_mute = QPushButton("Ztlumit")
-        self._btn_mute.setCheckable(True)
-        self._btn_mute.toggled.connect(self.audio_engine.set_muted)
-        audio.addWidget(self._btn_mute)
-        audio.addWidget(QLabel("  Squelch:"))
+        # Tuning controls
+        self._btn_freq_down = QPushButton("\u25c0")
+        self._btn_freq_down.setFixedWidth(30)
+        self._btn_freq_down.clicked.connect(lambda: self._step_freq(-1))
+        self._btn_freq_up = QPushButton("\u25b6")
+        self._btn_freq_up.setFixedWidth(30)
+        self._btn_freq_up.clicked.connect(lambda: self._step_freq(1))
+        vfo.addWidget(self._btn_freq_down)
+        vfo.addWidget(self._btn_freq_up)
+
+        # Quick tune buttons (MHz jump)
+        vfo.addStretch()
+        self._btn_m1 = QPushButton("M1")
+        self._btn_m1.setFixedWidth(32)
+        self._btn_m1.setToolTip("Ulozit/M1")
+        self._btn_m1.clicked.connect(lambda: self._recall_mem(1))
+        self._btn_m2 = QPushButton("M2")
+        self._btn_m2.setFixedWidth(32)
+        self._btn_m2.clicked.connect(lambda: self._recall_mem(2))
+        self._btn_m3 = QPushButton("M3")
+        self._btn_m3.setFixedWidth(32)
+        self._btn_m3.clicked.connect(lambda: self._recall_mem(3))
+        self._mem_slots = {1: 145.500e6, 2: 439.000e6, 3: 145.600e6}
+        vfo.addWidget(self._btn_m1)
+        vfo.addWidget(self._btn_m2)
+        vfo.addWidget(self._btn_m3)
+        parent.addWidget(vfo_frame)
+
+    def _vfo_btn_style(self, active: bool) -> str:
+        if active:
+            return (
+                "QPushButton { background: #1a3a5a; color: #88ddff; font-weight: bold; "
+                "padding: 2px 10px; border: 2px solid #3a8acc; border-radius: 3px; }"
+            )
+        return (
+            "QPushButton { background: #12122a; color: #888; "
+            "padding: 2px 10px; border: 1px solid #2a2a4e; border-radius: 3px; }"
+        )
+
+    def _build_band_mod_bar(self, parent):
+        bar = QHBoxLayout()
+        bar.setSpacing(2)
+
+        # Band buttons
+        for key in BAND_ORDER:
+            if key not in BAND_PLANS:
+                continue
+            bp = BAND_PLANS[key]
+            btn = QPushButton(key)
+            btn.setFixedHeight(26)
+            btn.setStyleSheet(
+                "QPushButton { background: #12122a; color: #88aacc; border: 1px solid #2a3a5a; "
+                "border-radius: 3px; padding: 0 8px; font-size: 10px; }"
+                "QPushButton:hover { background: #1a2a4a; border-color: #4a8acc; }"
+            )
+            btn.clicked.connect(lambda checked, k=key: self._jump_to_band(k))
+            bar.addWidget(btn)
+
+        bar.addStretch()
+
+        # Mode buttons
+        for mode in MODES:
+            btn = QPushButton(mode)
+            btn.setFixedHeight(26)
+            btn.setCheckable(True)
+            btn.setChecked(mode == self._current_mod)
+            btn.setStyleSheet(
+                "QPushButton { background: #12122a; color: #88aacc; border: 1px solid #2a3a5a; "
+                "border-radius: 3px; padding: 0 8px; font-size: 10px; }"
+                "QPushButton:hover { background: #1a2a4a; }"
+                "QPushButton:checked { background: #1a4a8a; color: #ffffff; border-color: #4a8acc; }"
+            )
+            btn.clicked.connect(lambda checked, m=mode: self._on_mode_click(m))
+            bar.addWidget(btn)
+        parent.addLayout(bar)
+
+    def _build_controls_bar(self, parent):
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+
+        # Squelch
+        bar.addWidget(QLabel("SQL:"))
         self._sld_squelch = QSlider(Qt.Orientation.Horizontal)
         self._sld_squelch.setRange(0, 100)
         self._sld_squelch.setValue(30)
-        self._sld_squelch.setFixedWidth(100)
+        self._sld_squelch.setFixedWidth(80)
         self._sld_squelch.valueChanged.connect(self._on_squelch_change)
-        audio.addWidget(self._sld_squelch)
-        self._lbl_squelch = QLabel("30%")
-        audio.addWidget(self._lbl_squelch)
+        bar.addWidget(self._sld_squelch)
+        self._lbl_squelch = QLabel("30")
+        self._lbl_squelch.setFixedWidth(24)
+        bar.addWidget(self._lbl_squelch)
+
+        # Volume
+        bar.addWidget(QLabel("VOL:"))
+        self._sld_vol = QSlider(Qt.Orientation.Horizontal)
+        self._sld_vol.setRange(0, 100)
+        self._sld_vol.setValue(int(self.settings.audio.volume * 100))
+        self._sld_vol.setFixedWidth(80)
+        self._sld_vol.valueChanged.connect(lambda v: self.audio_engine.set_volume(v / 100))
+        bar.addWidget(self._sld_vol)
+        self._lbl_vol = QLabel(f"{int(self.settings.audio.volume * 100)}%")
+        self._lbl_vol.setFixedWidth(28)
+        bar.addWidget(self._lbl_vol)
+
+        self._btn_mute = QPushButton("Mute")
+        self._btn_mute.setCheckable(True)
+        self._btn_mute.toggled.connect(self.audio_engine.set_muted)
+        bar.addWidget(self._btn_mute)
+
+        # AGC / NB / Record
         self._chk_agc = QCheckBox("AGC")
         self._chk_agc.setChecked(True)
-        audio.addWidget(self._chk_agc)
+        bar.addWidget(self._chk_agc)
         self._chk_nb = QCheckBox("NB")
         self._chk_nb.setToolTip("Noise blanker")
-        audio.addWidget(self._chk_nb)
-        self._chk_record = QCheckBox("Nahrávat")
+        bar.addWidget(self._chk_nb)
+        self._chk_record = QCheckBox("REC")
         self._chk_record.toggled.connect(self._toggle_record)
-        audio.addStretch()
-        self._btn_scan_start = QPushButton("🔍 Scan")
+        bar.addWidget(self._chk_record)
+
+        # Gain controls (Airspy)
+        bar.addWidget(QLabel(" LNA:"))
+        self._sld_lna = QSlider(Qt.Orientation.Horizontal)
+        self._sld_lna.setRange(0, 15)
+        self._sld_lna.setValue(8)
+        self._sld_lna.setFixedWidth(60)
+        self._sld_lna.valueChanged.connect(self._on_gain_change)
+        bar.addWidget(self._sld_lna)
+        bar.addWidget(QLabel("Mix:"))
+        self._sld_mixer = QSlider(Qt.Orientation.Horizontal)
+        self._sld_mixer.setRange(0, 15)
+        self._sld_mixer.setValue(8)
+        self._sld_mixer.setFixedWidth(60)
+        self._sld_mixer.valueChanged.connect(self._on_gain_change)
+        bar.addWidget(self._sld_mixer)
+        bar.addWidget(QLabel("VGA:"))
+        self._sld_vga = QSlider(Qt.Orientation.Horizontal)
+        self._sld_vga.setRange(0, 15)
+        self._sld_vga.setValue(8)
+        self._sld_vga.setFixedWidth(60)
+        self._sld_vga.valueChanged.connect(self._on_gain_change)
+        bar.addWidget(self._sld_vga)
+
+        bar.addStretch()
+
+        # Scan / Add channel buttons
+        self._btn_scan_start = QPushButton("Scan")
         self._btn_scan_start.clicked.connect(self._start_scanner)
-        audio.addWidget(self._btn_scan_start)
-        self._btn_add_ch = QPushButton("+ Kanál")
+        bar.addWidget(self._btn_scan_start)
+        self._btn_add_ch = QPushButton("+CH")
         self._btn_add_ch.clicked.connect(self._add_channel_dialog)
-        audio.addWidget(self._btn_add_ch)
-        parent.addLayout(audio)
+        bar.addWidget(self._btn_add_ch)
+        parent.addLayout(bar)
 
     def _build_info_tab(self):
         info = QWidget()
@@ -292,9 +426,9 @@ class MainWindow(QMainWindow):
         self._info_text = QTextEdit()
         self._info_text.setReadOnly(True)
         self._info_text.setStyleSheet("QTextEdit { background: #0a0a14; color: #ccc; font-family: Courier; }")
-        il.addWidget(QLabel("Informace o signálu:"))
+        il.addWidget(QLabel("Informace o signalu:"))
         il.addWidget(self._info_text)
-        self._tabs.addTab(info, "ℹ Info")
+        self._tabs.addTab(info, "Info")
 
     def _build_status_bar(self):
         self.sb = QStatusBar()
@@ -302,7 +436,7 @@ class MainWindow(QMainWindow):
         self._sb_freq = QLabel("Freq: ---")
         self._sb_dev = QLabel("Dev: ---")
         self._sb_sr = QLabel("SR: ---")
-        self._sb_state = QLabel("● STOP")
+        self._sb_state = QLabel("STOP")
         self._sb_state.setStyleSheet("color: #ff4444; font-weight: bold;")
         self._sb_sig = QLabel("Sig: --- dBm")
         self.sb.addWidget(self._sb_freq)
@@ -337,17 +471,17 @@ class MainWindow(QMainWindow):
         self.channel_table.channel_double_clicked.connect(self._on_channel_double_click)
 
     def _enumerate_devices(self):
-        self.bridge.status_message.emit("Vyhledávám SDR zařízení...")
+        self.bridge.status_message.emit("Vyhledavam SDR zarizeni...")
         results = self.device_mgr.enumerate()
         self._cmb_device.clear()
         if results:
             for idx, name in results:
                 self._cmb_device.addItem(name, idx)
             self.bridge.device_list.emit([n for _, n in results])
-            self.bridge.status_message.emit(f"Nalezeno {len(results)} zařízení")
+            self.bridge.status_message.emit(f"Nalezeno {len(results)} zarizeni")
         else:
-            self._cmb_device.addItem("Žádné SDR zařízení", -1)
-            self.bridge.status_message.emit("Nenalezeno SDR - pouze demo režim")
+            self._cmb_device.addItem("Zadne SDR zarizeni", -1)
+            self.bridge.status_message.emit("Nenalezeno SDR - pouze demo rezim")
 
     def _toggle_stream(self):
         if self._running:
@@ -366,10 +500,10 @@ class MainWindow(QMainWindow):
                     opened = dev.open()
                 except Exception as e:
                     opened = False
-                    self._log.append(f"[Chyba] Při otevírání zařízení vyjímka: {e}")
+                    self._log.append(f"[Chyba] Pri otevirani zarizeni: {e}")
             if not opened:
-                self._log.append("[Chyba] Zařízení nelze otevřít, přepínám do demo režimu (generování šumu).")
-                QMessageBox.warning(self, "Chyba", "Nelze otevřít SDR zařízení. Spouštím demo režim.")
+                self._log.append("[Chyba] Zarizeni nelze otevrit, prepinam do demo rezimu.")
+                QMessageBox.warning(self, "Chyba", "Nelze otevrit SDR zarizeni. Spoustim demo rezim.")
                 try:
                     self.device_mgr._active = None
                 except Exception:
@@ -386,14 +520,15 @@ class MainWindow(QMainWindow):
             self.audio_engine.set_notch(self.settings.audio.notch_freq)
 
         self._create_demodulator()
+        self._apply_gains()
 
         self._running = True
-        self._btn_start.setText("■ STOP")
+        self._btn_start.setText("RX ON")
         self._btn_start.setStyleSheet(
             "QPushButton { background: #5a1a1a; color: #ff4444; font-weight: bold; "
-            "padding: 4px 16px; border: 1px solid #8a2a2a; border-radius: 4px; }"
+            "padding: 4px 20px; border: 1px solid #8a2a2a; border-radius: 4px; font-size: 13px; }"
         )
-        self._sb_state.setText("● STREAM")
+        self._sb_state.setText("RX")
         self._sb_state.setStyleSheet("color: #00ff88; font-weight: bold;")
         dev_a = self.device_mgr.active
         if dev_a:
@@ -402,12 +537,12 @@ class MainWindow(QMainWindow):
             dev_a.set_center_freq(self._current_freq)
         self._sdr_thread_running = True
         if self.device_mgr.active and self.device_mgr.active.is_open:
-            self._log.append(f"[Info] Používám zařízení: {self.device_mgr.active.get_name()}")
+            self._log.append(f"[Info] Pouzivam: {self.device_mgr.active.get_name()}")
         else:
-            self._log.append("[Info] Demo režim: generuji šum pro waterfall a spektrum.")
+            self._log.append("[Info] Demo rezim.")
         threading.Thread(target=self._sdr_loop, daemon=True).start()
         self.usb_detector.start()
-        self.bridge.status_message.emit("SDR stream spuštěn")
+        self.bridge.status_message.emit("Prijimac spusten")
 
     def _create_demodulator(self):
         dev = self.device_mgr.active
@@ -416,21 +551,74 @@ class MainWindow(QMainWindow):
         self._demod.set_sample_rate(sr)
         self._demod.set_audio_rate(48000)
         self._demod.set_squelch(self._sld_squelch.value() / 100)
-        self._demod.set_agc(self._chk_agc.isChecked())
-        self._demod.set_noise_blanker(self._chk_nb.isChecked())
         self._squelched_count = 0
 
     def _on_squelch_change(self, value: int):
-        self._lbl_squelch.setText(f"{value}%")
+        self._lbl_squelch.setText(f"{value}")
         if self._demod:
             self._demod.set_squelch(value / 100)
 
-    def _on_modulation_change(self, mod: str):
-        self._current_mod = mod
-        self._lbl_mode.setText(mod)
-        self.settings.last_modulation = mod
+    def _on_mode_click(self, mode: str):
+        self._current_mod = mode
+        self._lbl_rx_mode.setText(mode)
+        for btn in self.findChildren(QPushButton):
+            if btn.text() in MODES:
+                btn.setChecked(btn.text() == mode)
+        self.settings.last_modulation = mode
         if self._running:
             self._create_demodulator()
+
+    def _on_gain_change(self):
+        self._apply_gains()
+
+    def _apply_gains(self):
+        dev = self.device_mgr.active
+        if not dev or not dev.is_open:
+            return
+        try:
+            dev.set_lna_gain(self._sld_lna.value())
+        except AttributeError:
+            pass
+        try:
+            dev.set_mixer_gain(self._sld_mixer.value())
+        except AttributeError:
+            pass
+        try:
+            dev.set_vga_gain(self._sld_vga.value())
+        except AttributeError:
+            pass
+
+    def _select_vfo(self, vfo: str):
+        if vfo == self._vfo_active:
+            return
+        # Save current freq
+        if self._vfo_active == "A":
+            self._vfo_a = self._current_freq
+        else:
+            self._vfo_b = self._current_freq
+        self._vfo_active = vfo
+        self._current_freq = self._vfo_a if vfo == "A" else self._vfo_b
+        self._btn_vfo_a.setStyleSheet(self._vfo_btn_style(vfo == "A"))
+        self._btn_vfo_b.setStyleSheet(self._vfo_btn_style(vfo == "B"))
+        self._set_frequency(self._current_freq)
+
+    def _swap_vfo(self):
+        self._vfo_a, self._vfo_b = self._vfo_b, self._vfo_a
+        if self._vfo_active == "A":
+            self._current_freq = self._vfo_a
+        else:
+            self._current_freq = self._vfo_b
+        self._set_frequency(self._current_freq)
+        self._log.append(f"[VFO] Prohozeno: A={self._vfo_a/1e6:.5f} B={self._vfo_b/1e6:.5f} MHz")
+
+    def _recall_mem(self, slot: int):
+        self._set_frequency(self._mem_slots.get(slot, 145.500e6))
+        # Long press would save - simple implementation: click to recall, double-click not easily supported
+        # So we just recall. To save: hold shift+click
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            self._mem_slots[slot] = self._current_freq
+            self._log.append(f"[MEM] M{slot} ulozeno: {self._current_freq/1e6:.5f} MHz")
 
     def _stop_stream(self):
         self._sdr_thread_running = False
@@ -440,42 +628,50 @@ class MainWindow(QMainWindow):
             self.device_mgr.active.stop_stream()
             self.device_mgr.active.close()
         self.usb_detector.stop()
-        self._btn_start.setText("▶ START")
+        self._btn_start.setText("RX")
         self._btn_start.setStyleSheet(
             "QPushButton { background: #1a5a1a; color: #00ff88; font-weight: bold; "
-            "padding: 4px 16px; border: 1px solid #2a8a2a; border-radius: 4px; }"
+            "padding: 4px 20px; border: 1px solid #2a8a2a; border-radius: 4px; font-size: 13px; }"
         )
-        self._sb_state.setText("● STOP")
+        self._sb_state.setText("STOP")
         self._sb_state.setStyleSheet("color: #ff4444; font-weight: bold;")
-        self.bridge.status_message.emit("Stream zastaven")
+        self.bridge.status_message.emit("Prijimac zastaven")
 
     def _step_freq(self, direction: int):
         step_text = self._cmb_step.currentText()
         step_hz = float(step_text.split()[0]) * 1000
         self._current_freq += direction * step_hz
+        # Keep in band
+        for key, bp in BAND_PLANS.items():
+            if bp['lo'] <= self._current_freq <= bp['hi'] or (
+                self._current_freq >= bp['lo'] - step_hz and self._current_freq <= bp['hi'] + step_hz
+            ):
+                self._current_freq = max(bp['lo'], min(bp['hi'], self._current_freq))
+                break
         self._set_frequency(self._current_freq)
 
     def _set_frequency(self, freq_hz: float):
         self._current_freq = freq_hz
         self._lbl_freq.setText(f"{freq_hz / 1e6:.5f}")
+        self._lbl_rx_freq.setText(f"{freq_hz / 1e6:.5f}")
         self._sb_freq.setText(f"Freq: {freq_hz / 1e6:.5f} MHz")
         dev = self.device_mgr.active
         if dev and dev.is_open:
             dev.set_center_freq(freq_hz)
-        self.spectrum.set_freq_range(freq_hz, dev.get_sample_rate() if dev else 2.4e6)
-        self.waterfall.set_freq_range(freq_hz, dev.get_sample_rate() if dev else 2.4e6)
+        sr = dev.get_sample_rate() if dev else 2.4e6
+        self.spectrum.set_freq_range(freq_hz, sr)
+        self.waterfall.set_freq_range(freq_hz, sr)
         self._update_band_display()
-        self.bridge.status_message.emit(f"Ladím na {freq_hz/1e6:.5f} MHz")
 
     def _update_band_display(self):
         for key, bp in BAND_PLANS.items():
             if bp['lo'] <= self._current_freq <= bp['hi']:
-                self._lbl_band_name.setText(key)
-                band_bands = [(key, bp['lo'], bp['hi'], (60, 60, 100))]
-                self.spectrum.set_band_data(band_bands)
-                self.waterfall.set_band_data(band_bands)
+                if key != self._last_band:
+                    self._last_band = key
+                    # Auto-select modulation for band
+                    if bp.get('mod') and self._current_mod != bp['mod'] and not self._running:
+                        self._on_mode_click(bp['mod'])
                 return
-        self._lbl_band_name.setText("---")
 
     def _jump_to_band(self, key: str):
         bp = BAND_PLANS.get(key)
@@ -483,7 +679,7 @@ class MainWindow(QMainWindow):
             mid = (bp['lo'] + bp['hi']) / 2
             self._set_frequency(mid)
             if bp['mod']:
-                self._cmb_mod.setCurrentText(bp['mod'])
+                self._on_mode_click(bp['mod'])
 
     def _jump_to_repeater(self, r: dict):
         self._set_frequency(r['freq'])
@@ -492,7 +688,7 @@ class MainWindow(QMainWindow):
 
     def _on_channel_double_click(self, channel: Channel):
         self._set_frequency(channel.frequency)
-        self._cmb_mod.setCurrentText(channel.modulation)
+        self._on_mode_click(channel.modulation)
         self._current_channel = channel
 
     def _on_freq_changed(self, freq_hz: float):
@@ -507,7 +703,7 @@ class MainWindow(QMainWindow):
             new_ch = dialog.get_channel()
             self.channel_table.add_channel(new_ch)
             self.scanner.add_channel(new_ch)
-            self._log.append(f"[Kanál] Přidán: {new_ch.frequency/1e6:.5f} MHz {new_ch.label}")
+            self._log.append(f"[Kanal] Pridan: {new_ch.frequency/1e6:.5f} {new_ch.label}")
 
     def _set_decoder(self, protocol: str):
         if protocol:
@@ -515,21 +711,21 @@ class MainWindow(QMainWindow):
                 self._decoder = DecoderFactory.create(protocol)
                 self._decoder.set_debug_callback(
                     lambda m: self.bridge.decoder_metadata.emit(m))
-                self._log.append(f"[Dekodér] Aktivován: {protocol}")
+                self._log.append(f"[Dekoder] Aktivovan: {protocol}")
             except:
                 self._decoder = None
         else:
             self._decoder = None
-            self._log.append("[Dekodér] Vypnut")
+            self._log.append("[Dekoder] Vypnut")
 
     def _toggle_record(self, enabled):
         if enabled:
-            self.recorder.start_recording()
-            self._log.append("[Nahrávání] Spuštěno")
+            self.recorder.start_recording(freq_hz=self._current_freq, mode=self._current_mod)
+            self._log.append(f"[REC] Spusteno: {self._current_freq/1e6:.3f} MHz {self._current_mod}")
         else:
             fname = self.recorder.stop_recording()
             if fname:
-                self._log.append(f"[Nahrávání] Uloženo: {fname}")
+                self._log.append(f"[REC] Ulozeno: {fname}")
 
     def _start_scanner(self):
         self.scanner.set_callbacks(
@@ -548,20 +744,17 @@ class MainWindow(QMainWindow):
             for key, bp in BAND_PLANS.items():
                 if bp['lo'] > 0 and bp['hi'] > bp['lo']:
                     band_list.append({
-                        'name': key,
-                        'lo': bp['lo'],
-                        'hi': bp['hi'],
-                        'step': bp.get('step', 12.5e3),
-                        'mod': bp.get('mod', 'NFM'),
+                        'name': key, 'lo': bp['lo'], 'hi': bp['hi'],
+                        'step': bp.get('step', 12.5e3), 'mod': bp.get('mod', 'NFM'),
                     })
             self.scanner.load_bands(band_list)
             band_count = len(band_list)
-            self._log.append(f"[Skener] Nahráno {band_count} amatérských pásem pro skenování")
+            self._log.append(f"[Skener] {band_count} pásem nacteno")
 
         self.scanner.start()
         self.scanner_panel.set_running(True)
-        self._log.append(f"[Skener] Spuštěn ({len(channels)} kanálů, {band_count} pásem)")
-        self.bridge.status_message.emit("Skener spuštěn")
+        self._log.append(f"[Skener] Spusten ({len(channels)} kanalu, {band_count} pasem)")
+        self.bridge.status_message.emit("Skener spusten")
 
     def _stop_scanner(self):
         self.scanner.stop()
@@ -572,18 +765,14 @@ class MainWindow(QMainWindow):
         self._current_channel = channel
         self._set_frequency(channel.frequency)
         if channel.modulation != self._current_mod:
-            self._current_mod = channel.modulation
-            self._cmb_mod.setCurrentText(channel.modulation)
-            if self._running:
-                self._create_demodulator()
-        self.scanner_panel.update_status(f"{channel.frequency/1e6:.5f} MHz {channel.label}")
+            self._on_mode_click(channel.modulation)
+        self.scanner_panel.update_status(f"{channel.frequency/1e6:.5f} {channel.label}")
 
     def _on_signal_detected(self, channel: Channel, power_db: float):
-        self.sb.showMessage(f"Signál: {channel.frequency/1e6:.5f} MHz @ {power_db:.1f} dB", 2000)
+        self.sb.showMessage(f"Signal: {channel.frequency/1e6:.5f} MHz @ {power_db:.1f} dB", 2000)
 
     def _on_decoder_metadata(self, meta: dict):
         proto = meta.get("protocol", "---")
-        self._lbl_decoder.setText(f"Dekodér: {proto}")
         tg_info = ""
         if "nac" in meta:
             tg_info = f"NAC: {meta['nac']:#05x}"
@@ -591,19 +780,14 @@ class MainWindow(QMainWindow):
             tg_info = f"CC: {meta['color_code']}"
         elif "talkgroup" in meta:
             tg_info = f"TG: {meta['talkgroup']}"
-        self._lbl_talkgroup.setText(tg_info)
         if "ber" in meta:
             self._sb_sig.setText(f"Sig: {meta.get('rssi', 0)} dBm  BER: {meta['ber']}%")
 
     def _on_ctcss(self, freq: float):
-        if freq > 0:
-            self._lbl_ctcss.setText(f"CTCSS: {freq:.1f} Hz")
-        else:
-            self._lbl_ctcss.setText("")
+        pass
 
     def _on_dtmf(self, digit: str):
-        self._lbl_dtmf.setText(f"DTMF: {digit}")
-        QTimer.singleShot(1500, lambda: self._lbl_dtmf.setText(""))
+        pass
 
     def _on_usb_event(self, event: str, info: dict):
         self._log.append(f"[USB] {event}: {info.get('name', '')}")
@@ -619,7 +803,7 @@ class MainWindow(QMainWindow):
         self.bridge.trunk_event.emit(event, data)
 
     def _on_device_list(self, names: list):
-        self._log.append(f"[SDR] Nalezena zařízení: {', '.join(names)}")
+        self._log.append(f"[SDR] Nalezena: {', '.join(names)}")
 
     def _sdr_loop(self):
         dev = self.device_mgr.active
@@ -636,7 +820,7 @@ class MainWindow(QMainWindow):
             if audio is not None:
                 self._squelched_count = 0
                 self.bridge.audio_ready.emit(audio)
-                if self.scanner and self.scanner.current_channel:
+                if self.scanner.current_channel:
                     self.scanner.signal_active(signal.analyze(samples)["dbm"])
                 ctcss = self._ctcss_decoder.detect_tone(audio)
                 if ctcss[0] > 0:
@@ -646,7 +830,7 @@ class MainWindow(QMainWindow):
                     self.bridge.dtmf_detected.emit(dtmf)
             else:
                 self._squelched_count += 1
-                if self._squelched_count > 10 and self.scanner:
+                if self._squelched_count > 10:
                     self.scanner.signal_lost()
                     self._squelched_count = 0
             psd = 20 * np.log10(np.abs(np.fft.fftshift(np.fft.fft(samples, 1024))) + 1e-15)
@@ -682,21 +866,23 @@ class MainWindow(QMainWindow):
         if self.settings.last_freq:
             self._set_frequency(self.settings.last_freq)
         if self.settings.last_modulation:
-            self._cmb_mod.setCurrentText(self.settings.last_modulation)
+            self._on_mode_click(self.settings.last_modulation)
 
     def closeEvent(self, event):
         self._stop_stream()
         if self.audio_engine.is_open:
             self.audio_engine.close()
-        self.settings.last_freq = self._current_freq
+        if self._vfo_active == "A":
+            self.settings.last_freq = self._vfo_a
+        else:
+            self.settings.last_freq = self._vfo_b
         self.settings.last_modulation = self._current_mod
         self.settings.audio.volume = self._sld_vol.value() / 100
         favs = []
         for ch in self.channel_table.channels:
             favs.append({
                 "label": ch.label, "freq_hz": ch.frequency,
-                "modulation": ch.modulation, "squelch": ch.squelch,
-                "bank": ch.bank,
+                "modulation": ch.modulation, "squelch": ch.squelch, "bank": ch.bank,
             })
         self.settings.favorites = favs
         self.settings.save()
