@@ -2,9 +2,13 @@ import numpy as np
 from typing import Optional, Callable
 from abc import ABC, abstractmethod
 from scipy import signal as scipy_signal
+from scipy.fft import fft, ifft, rfft, rfftfreq, fftshift
+from numpy.fft import hfft
 
 
 class Demodulator(ABC):
+    _fft_cache: dict[int, np.ndarray] = {}
+
     def __init__(self):
         self._callback: Optional[Callable[[np.ndarray], None]] = None
         self._squelch_threshold: float = 0.0
@@ -20,6 +24,7 @@ class Demodulator(ABC):
         self._hp_filter: Optional[np.ndarray] = None
         self._hp_sos: Optional[np.ndarray] = None
         self._hp_zi: Optional[np.ndarray] = None
+        self._filter_zi: Optional[np.ndarray] = None
 
     def set_callback(self, cb: Callable[[np.ndarray], None]):
         self._callback = cb
@@ -76,13 +81,13 @@ class Demodulator(ABC):
     def _detect_ctcss(self, audio: np.ndarray) -> float:
         if self._ctcss_freq <= 0:
             return 0.0
-        fft = np.fft.rfft(audio * np.hanning(len(audio)))
-        freqs = np.fft.rfftfreq(len(audio), 1.0 / self._audio_rate)
+        win = np.hanning(len(audio))
+        f = rfft(audio * win)
+        freqs = rfftfreq(len(audio), 1.0 / self._audio_rate)
         idx = np.argmin(np.abs(freqs - self._ctcss_freq))
-        power = np.abs(fft[idx])
-        total = np.sum(np.abs(fft))
-        ratio = power / (total + 1e-10)
-        return power if ratio > 0.05 else 0.0
+        power = np.abs(f[idx])
+        total = np.sum(np.abs(f)) + 1e-15
+        return power if power / total > 0.05 else 0.0
 
     def _squelch_check(self, audio: np.ndarray) -> bool:
         if len(audio) < 4:
@@ -90,27 +95,23 @@ class Demodulator(ABC):
         if self._squelch_threshold <= 0:
             return True
         if self._squelch_type == "noise":
-            # Fast noise estimation via HP filter
             if self._hp_sos is not None:
                 filtered, _ = scipy_signal.sosfilt(self._hp_sos, audio, zi=self._hp_zi * 0)
             else:
                 filtered = audio - np.mean(audio)
             noise_pwr = np.sqrt(np.mean(filtered ** 2))
             audio_pwr = np.sqrt(np.mean(audio ** 2))
-            ratio = audio_pwr / (noise_pwr + 1e-10)
-            return ratio > self._squelch_threshold
+            return (audio_pwr / (noise_pwr + 1e-10)) > self._squelch_threshold
         elif self._squelch_type == "power":
-            pwr = 20 * np.log10(np.max(np.abs(audio)) + 1e-10)
-            return pwr > self._squelch_threshold
+            return (20 * np.log10(np.max(np.abs(audio)) + 1e-10)) > self._squelch_threshold
         elif self._squelch_type == "ctcss":
-            ctcss_pwr = self._detect_ctcss(audio)
-            return ctcss_pwr > self._squelch_threshold
+            return self._detect_ctcss(audio) > self._squelch_threshold
         return True
 
     def _decimate(self, audio: np.ndarray) -> np.ndarray:
-        ratio = self._sample_rate / self._audio_rate
-        if ratio < 1:
+        if self._sample_rate <= self._audio_rate:
             return audio
+        ratio = self._sample_rate / self._audio_rate
         decim = max(1, int(np.round(ratio)))
         if decim > 1 and len(audio) >= decim + 10:
             audio = scipy_signal.decimate(audio, decim, ftype='iir', zero_phase=True)
@@ -178,7 +179,7 @@ class AMDemodulator(Demodulator):
     def demodulate(self, iq_samples: np.ndarray) -> np.ndarray:
         iq = np.asarray(iq_samples, dtype=np.complex64)
         env = np.abs(iq)
-        env = env - np.mean(env)
+        env -= np.mean(env)
         lp = scipy_signal.firwin(63, 5000, fs=self._sample_rate)
         if len(env) > len(lp):
             env = scipy_signal.convolve(env, lp, mode='same')
@@ -188,12 +189,12 @@ class AMDemodulator(Demodulator):
 class USBDemodulator(Demodulator):
     def demodulate(self, iq_samples: np.ndarray) -> np.ndarray:
         iq = np.asarray(iq_samples, dtype=np.complex64)
-        fft = np.fft.fft(iq)
-        n = len(fft)
-        fft[:n // 2] = 0
-        iq_usb = np.fft.ifft(fft)
+        s = fft(iq)
+        n = len(s)
+        s[:n // 2] = 0
+        iq_usb = ifft(s)
         audio = np.abs(iq_usb)
-        audio = audio - np.mean(audio)
+        audio -= np.mean(audio)
         lp = scipy_signal.firwin(63, 3000, fs=self._sample_rate)
         if len(audio) > len(lp):
             audio = scipy_signal.convolve(audio, lp, mode='same')
@@ -203,12 +204,12 @@ class USBDemodulator(Demodulator):
 class LSBDemodulator(Demodulator):
     def demodulate(self, iq_samples: np.ndarray) -> np.ndarray:
         iq = np.asarray(iq_samples, dtype=np.complex64)
-        fft = np.fft.fft(iq)
-        n = len(fft)
-        fft[n // 2:] = 0
-        iq_lsb = np.fft.ifft(fft)
+        s = fft(iq)
+        n = len(s)
+        s[n // 2:] = 0
+        iq_lsb = ifft(s)
         audio = np.abs(iq_lsb)
-        audio = audio - np.mean(audio)
+        audio -= np.mean(audio)
         lp = scipy_signal.firwin(63, 3000, fs=self._sample_rate)
         if len(audio) > len(lp):
             audio = scipy_signal.convolve(audio, lp, mode='same')

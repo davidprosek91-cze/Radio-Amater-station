@@ -1,6 +1,6 @@
 import threading, time
 from typing import Optional, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -35,6 +35,7 @@ class ScannerEngine:
         self._lock = threading.Lock()
         self._on_channel_change: Optional[Callable[[Channel], None]] = None
         self._on_signal: Optional[Callable[[Channel, float], None]] = None
+        self._on_hold: Optional[Callable[[Channel, float], None]] = None
         self._hold_time_ms = 3000
         self._hang_time_ms = 2000
         self._hold_channel: Optional[Channel] = None
@@ -48,16 +49,32 @@ class ScannerEngine:
         self._search_band = (144.0e6, 148.0e6, 12.5e3, "NFM")
         self._thread: Optional[threading.Thread] = None
         self._signal_present = False
+        self._captured: set[float] = set()
+        self._auto_capture: bool = False
+        self._capture_bank: str = "Scan Bank"
 
-    def set_callbacks(self, on_channel=None, on_signal=None):
+    def set_callbacks(self, on_channel=None, on_signal=None, on_hold=None):
         self._on_channel_change = on_channel
         self._on_signal = on_signal
+        self._on_hold = on_hold
 
     def set_hold_time(self, ms: int):
         self._hold_time_ms = ms
 
     def set_hang_time(self, ms: int):
         self._hang_time_ms = ms
+
+    def set_auto_capture(self, enabled: bool, bank: str = "Scan Bank"):
+        self._auto_capture = enabled
+        self._capture_bank = bank
+
+    def get_captured_freqs(self) -> list[float]:
+        with self._lock:
+            return sorted(self._captured)
+
+    def clear_captured(self):
+        with self._lock:
+            self._captured.clear()
 
     def load_channels(self, channels: list[Channel]):
         with self._lock:
@@ -166,12 +183,17 @@ class ScannerEngine:
 
     def signal_detected(self, channel: Channel, power_db: float):
         with self._lock:
+            was_searching = self._state == self.SEARCH
             self._hold_channel = channel
             self._hang_until = time.time() + self._hang_time_ms / 1000.0
             self._state = self.HOLD
             self._signal_present = True
         if self._on_signal:
             self._on_signal(channel, power_db)
+        if was_searching and self._auto_capture and channel and channel.frequency not in self._captured:
+            self._captured.add(channel.frequency)
+            if self._on_hold:
+                self._on_hold(channel, power_db)
 
     def signal_active(self, power_db: float):
         with self._lock:

@@ -32,6 +32,30 @@ class AudioFilter:
         return audio
 
 
+class AudioAGC:
+    def __init__(self, rate: float = 48000.0):
+        self._rate = rate
+        self._gain = 0.5
+        self._attack = 0.02
+        self._decay = 0.002
+        self._target_rms = 0.12
+        self._max_gain = 50.0
+        self._min_gain = 0.01
+        self._smooth = 0.7
+
+    def process(self, audio: np.ndarray) -> np.ndarray:
+        if len(audio) < 4:
+            return audio
+        rms = np.sqrt(np.mean(audio ** 2)) + 1e-10
+        target = self._target_rms / rms
+        if target > self._gain:
+            self._gain += self._attack * (target - self._gain)
+        else:
+            self._gain += self._decay * (target - self._gain)
+        self._gain = np.clip(self._gain, self._min_gain, self._max_gain)
+        return np.clip(audio * self._gain, -1.0, 1.0)
+
+
 class AudioEngine:
     def __init__(self, sample_rate: float = 48000.0):
         self._sr = sample_rate
@@ -42,7 +66,8 @@ class AudioEngine:
         self._lock = threading.Lock()
         self._running = False
         self._filter = AudioFilter(sample_rate)
-        self._last_audio_level: float = 0.0
+        self._agc = AudioAGC(sample_rate)
+        self._last_level: float = 0.0
 
     def open(self) -> bool:
         try:
@@ -95,15 +120,13 @@ class AudioEngine:
         with self._lock:
             if self._running:
                 processed = self._filter.apply(samples)
-                processed = np.clip(processed, -1.0, 1.0)
+                processed = self._agc.process(processed)
                 self._buffer.append(processed)
+                self._last_level = float(np.sqrt(np.mean(processed ** 2)))
 
     @property
     def audio_level(self) -> float:
-        with self._lock:
-            if self._buffer:
-                return float(np.max(np.abs(self._buffer[-1]))) if len(self._buffer[-1]) > 0 else 0.0
-            return 0.0
+        return self._last_level
 
     def set_notch(self, freq_hz: float):
         self._filter.set_notch(freq_hz)
@@ -113,6 +136,9 @@ class AudioEngine:
 
     def set_muted(self, muted: bool):
         self._muted = muted
+
+    def set_agc(self, enabled: bool):
+        pass
 
     @property
     def is_open(self) -> bool:

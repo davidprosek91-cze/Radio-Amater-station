@@ -23,6 +23,8 @@ from ui.scanner_panel import ScannerPanel
 from ui.trunk_panel import TrunkPanel
 from ui.frequency_editor import FrequencyEditor
 
+from scipy.fft import fft, fftshift
+
 
 BAND_ORDER = ["160m","80m","40m","30m","20m","17m","15m","12m","10m","6m","2m","70cm","23cm"]
 MODES = ["NFM","FM","AM","USB","LSB","WFM"]
@@ -350,11 +352,11 @@ class MainWindow(QMainWindow):
         bar.addWidget(QLabel("SQL:"))
         self._sld_squelch = QSlider(Qt.Orientation.Horizontal)
         self._sld_squelch.setRange(0, 100)
-        self._sld_squelch.setValue(30)
+        self._sld_squelch.setValue(50)
         self._sld_squelch.setFixedWidth(80)
         self._sld_squelch.valueChanged.connect(self._on_squelch_change)
         bar.addWidget(self._sld_squelch)
-        self._lbl_squelch = QLabel("30")
+        self._lbl_squelch = QLabel("50")
         self._lbl_squelch.setFixedWidth(24)
         bar.addWidget(self._lbl_squelch)
 
@@ -731,9 +733,13 @@ class MainWindow(QMainWindow):
         self.scanner.set_callbacks(
             on_channel=lambda ch: self.bridge.channel_changed.emit(ch),
             on_signal=lambda ch, db: self.bridge.signal_detected.emit(ch, db),
+            on_hold=self._on_scanner_hold,
         )
         self.scanner.set_hold_time(self.scanner_panel._hold_time.value())
         self.scanner.set_hang_time(self.scanner_panel._hang_time.value())
+
+        auto_capture = self.scanner_panel._chk_autocap.isChecked()
+        self.scanner.set_auto_capture(auto_capture, "Scan Bank")
 
         channels = self.channel_table.channels
         self.scanner.load_channels(channels)
@@ -749,12 +755,28 @@ class MainWindow(QMainWindow):
                     })
             self.scanner.load_bands(band_list)
             band_count = len(band_list)
-            self._log.append(f"[Skener] {band_count} pásem nacteno")
+            self._log.append(f"[Skener] {band_count} pasem nacteno")
 
         self.scanner.start()
         self.scanner_panel.set_running(True)
         self._log.append(f"[Skener] Spusten ({len(channels)} kanalu, {band_count} pasem)")
         self.bridge.status_message.emit("Skener spusten")
+
+    def _on_scanner_hold(self, channel: Channel, power_db: float):
+        freq = channel.frequency
+        mod = channel.modulation
+        label = f"Scan {freq/1e6:.3f}"
+        # check if already in channel table
+        for ch in self.channel_table.channels:
+            if abs(ch.frequency - freq) < 100:
+                return
+        new_ch = Channel(
+            frequency=freq, modulation=mod, label=label,
+            bank="Scan Bank", squelch=0.4,
+        )
+        self.channel_table.add_channel(new_ch)
+        self.scanner.add_channel(new_ch)
+        self._log.append(f"[ScanBank] Pridano: {freq/1e6:.5f} MHz {mod}")
 
     def _stop_scanner(self):
         self.scanner.stop()
@@ -833,7 +855,7 @@ class MainWindow(QMainWindow):
                 if self._squelched_count > 10:
                     self.scanner.signal_lost()
                     self._squelched_count = 0
-            psd = 20 * np.log10(np.abs(np.fft.fftshift(np.fft.fft(samples, 1024))) + 1e-15)
+            psd = 20 * np.log10(np.abs(fftshift(fft(samples, 1024))) + 1e-15)
             self.bridge.psd_ready.emit(psd)
             sig = signal.analyze(samples)
             self.bridge.s_meter_update.emit(sig["dbm"])
