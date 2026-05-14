@@ -1,8 +1,8 @@
 import numpy as np
-from typing import Optional
+from typing import Optional, Callable
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
-from PyQt6.QtGui import QPainter, QColor, QLinearGradient, QPen, QFont
-from PyQt6.QtCore import Qt, QRectF
+from PyQt6.QtGui import QPainter, QColor, QLinearGradient, QPen, QFont, QMouseEvent, QWheelEvent
+from PyQt6.QtCore import Qt, QRectF, pyqtSignal
 
 
 S_UNITS = [
@@ -54,7 +54,6 @@ class SMeterWidget(QWidget):
             grad.setColorAt(1.0, QColor(200, 0, 0))
             painter.fillRect(margin + 1, bar_y + 1, fill_w - 1, bar_h - 2, grad)
 
-        # S-unit tick marks
         painter.setPen(QPen(QColor(100, 100, 120), 1))
         font = QFont("Sans", 6)
         painter.setFont(font)
@@ -67,13 +66,11 @@ class SMeterWidget(QWidget):
             painter.setPen(QColor(160, 160, 180))
             painter.drawText(x - 12, bar_y + bar_h + 1, 24, 10, Qt.AlignmentFlag.AlignCenter, label)
 
-        # Peak dot
         peak_norm = (self._peak - db_min) / (db_max - db_min)
         peak_x = margin + int(bar_w * peak_norm)
         painter.setPen(QPen(QColor(255, 255, 255), 2))
         painter.drawEllipse(peak_x - 2, bar_y - 1, 5, 5)
 
-        # dBm value overlay
         painter.setPen(QColor(0, 255, 100))
         font2 = QFont("Courier", 9, QFont.Weight.Bold)
         painter.setFont(font2)
@@ -81,7 +78,6 @@ class SMeterWidget(QWidget):
         painter.drawText(QRectF(margin, bar_y, bar_w, bar_h), Qt.AlignmentFlag.AlignCenter,
                          f"{self._dbm:.0f} dBm  {s_text}")
 
-        # Audio level meter (bottom bar)
         audio_y = bar_y + bar_h + 14
         painter.setPen(QPen(QColor(60, 60, 80), 1))
         painter.drawRect(margin, audio_y, bar_w, 8)
@@ -100,7 +96,6 @@ class SMeterWidget(QWidget):
         font3 = QFont("Sans", 6)
         painter.setFont(font3)
         painter.drawText(margin, audio_y + 7, "AUDIO")
-
         painter.end()
 
     def _dbm_to_s(self, dbm: float) -> str:
@@ -135,7 +130,29 @@ class BandPlanOverlay:
             painter.drawText(x1 + 2, 10, name)
 
 
+class FrequencyMarker:
+    """Draws a vertical line + label at a specific frequency."""
+    @staticmethod
+    def draw(painter: QPainter, w: int, h: int, center: float, span: float,
+             freq: float, color: QColor, label: str = ""):
+        lo = center - span / 2
+        hi = center + span / 2
+        if freq < lo or freq > hi:
+            return
+        x = int(w * (freq - lo) / (hi - lo))
+        painter.setPen(QPen(color, 2))
+        painter.drawLine(x, 0, x, h)
+        if label:
+            painter.setFont(QFont("Sans", 8, QFont.Weight.Bold))
+            painter.setPen(color)
+            painter.drawText(x + 3, 14, label)
+
+
 class WaterfallWidget(QWidget):
+    freq_clicked = pyqtSignal(float)
+    freq_dragged = pyqtSignal(float)
+    wheel_zoomed = pyqtSignal(float)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._history: list[np.ndarray] = []
@@ -146,7 +163,10 @@ class WaterfallWidget(QWidget):
         self._max_db = 0
         self._band_overlay = BandPlanOverlay()
         self._band_data: list[tuple] = []
+        self._vfo_freq: Optional[float] = None
+        self._center_freq_display: Optional[float] = None
         self.setMinimumHeight(180)
+        self.setMouseTracking(True)
 
     def set_freq_range(self, center: float, span: float):
         self._center_freq = center
@@ -155,6 +175,12 @@ class WaterfallWidget(QWidget):
     def set_band_data(self, bands: list[tuple]):
         self._band_data = bands
         self._band_overlay.set_bands(bands)
+
+    def set_vfo_freq(self, freq: float):
+        self._vfo_freq = freq
+
+    def set_center_marker(self, freq: float):
+        self._center_freq_display = freq
 
     def push_fft(self, psd: np.ndarray):
         self._history.append(psd.copy())
@@ -165,6 +191,27 @@ class WaterfallWidget(QWidget):
     def clear(self):
         self._history.clear()
         self.update()
+
+    def _freq_from_x(self, x: int) -> float:
+        w = self.width()
+        lo = self._center_freq - self._span / 2
+        hi = self._center_freq + self._span / 2
+        return lo + (hi - lo) * x / w
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            freq = self._freq_from_x(event.position().x())
+            self.freq_clicked.emit(freq)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            freq = self._freq_from_x(event.position().x())
+            self.freq_dragged.emit(freq)
+
+    def wheelEvent(self, event: QWheelEvent):
+        delta = event.angleDelta().y()
+        factor = 1.2 if delta > 0 else 0.8
+        self.wheel_zoomed.emit(factor)
 
     def paintEvent(self, event):
         if not self._history:
@@ -188,6 +235,14 @@ class WaterfallWidget(QWidget):
                     int(ci * col_w), int(ri * row_h), int(col_w * 2 + 1), int(row_h + 1), color
                 )
         self._band_overlay.draw(painter, w, h, self._center_freq, self._span)
+
+        if self._center_freq_display is not None:
+            FrequencyMarker.draw(painter, w, h, self._center_freq, self._span,
+                                 self._center_freq_display, QColor(200, 200, 0, 100), "CF")
+        if self._vfo_freq is not None:
+            FrequencyMarker.draw(painter, w, h, self._center_freq, self._span,
+                                 self._vfo_freq, QColor(0, 255, 100), "VFO")
+
         self._draw_overlay(painter, w, h)
         painter.end()
 
@@ -219,6 +274,10 @@ class WaterfallWidget(QWidget):
 
 
 class SpectrumWidget(QWidget):
+    freq_clicked = pyqtSignal(float)
+    freq_dragged = pyqtSignal(float)
+    wheel_zoomed = pyqtSignal(float)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._psd = np.zeros(512)
@@ -232,7 +291,10 @@ class SpectrumWidget(QWidget):
         self._band_data: list[tuple] = []
         self._avg_psd: Optional[np.ndarray] = None
         self._avg_alpha = 0.3
+        self._vfo_freq: Optional[float] = None
+        self._center_freq_marker: Optional[float] = None
         self.setMinimumHeight(120)
+        self.setMouseTracking(True)
 
     def set_freq_range(self, center: float, span: float):
         self._center_freq = center
@@ -241,6 +303,12 @@ class SpectrumWidget(QWidget):
     def set_band_data(self, bands: list[tuple]):
         self._band_data = bands
         self._band_overlay.set_bands(bands)
+
+    def set_vfo_freq(self, freq: float):
+        self._vfo_freq = freq
+
+    def set_center_marker(self, freq: float):
+        self._center_freq_marker = freq
 
     def update_psd(self, psd: np.ndarray):
         self._psd = psd
@@ -251,6 +319,27 @@ class SpectrumWidget(QWidget):
         if len(psd) == len(self._peak_hold):
             self._peak_hold = np.maximum(self._peak_hold * self._decay, psd)
         self.update()
+
+    def _freq_from_x(self, x: int) -> float:
+        w = self.width()
+        lo = self._center_freq - self._span / 2
+        hi = self._center_freq + self._span / 2
+        return lo + (hi - lo) * x / w
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            freq = self._freq_from_x(event.position().x())
+            self.freq_clicked.emit(freq)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            freq = self._freq_from_x(event.position().x())
+            self.freq_dragged.emit(freq)
+
+    def wheelEvent(self, event: QWheelEvent):
+        delta = event.angleDelta().y()
+        factor = 1.2 if delta > 0 else 0.8
+        self.wheel_zoomed.emit(factor)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -285,6 +374,13 @@ class SpectrumWidget(QWidget):
             norm = max(0.0, min(1.0, norm))
             y = int(h * (1 - norm))
             painter.drawPoint(x, y)
+
+        if self._center_freq_marker is not None:
+            FrequencyMarker.draw(painter, w, h, self._center_freq, self._span,
+                                 self._center_freq_marker, QColor(200, 200, 0, 80), "CF")
+        if self._vfo_freq is not None:
+            FrequencyMarker.draw(painter, w, h, self._center_freq, self._span,
+                                 self._vfo_freq, QColor(0, 255, 100), "VFO")
 
         self._draw_grid(painter, w, h)
         painter.end()
